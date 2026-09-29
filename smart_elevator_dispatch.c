@@ -5,6 +5,7 @@
 #define NUM_FLOORS 11       // Floors 0 to 10 (0 = Ground Floor)
 #define NUM_ELEVATORS 3    // 3 Elevators: E1 (Local), E2 (Express), E3 (Local)
 #define MAX_QUEUE 20
+#define HASH_TABLE_SIZE 31
 
 // DATA STRUCTURES
 
@@ -38,6 +39,103 @@ typedef struct {
     int size;
 } PriorityQueue;
 
+typedef enum {
+    REQUEST_QUEUED,
+    REQUEST_COMPLETED,
+    REQUEST_UNSERVED,
+    REQUEST_REJECTED,
+    REQUEST_PROCESSING
+} RequestStatus;
+
+typedef struct RequestHashNode {
+    Request request;
+    RequestStatus status;
+    struct RequestHashNode* next;
+} RequestHashNode;
+
+typedef struct {
+    RequestHashNode* buckets[HASH_TABLE_SIZE];
+} RequestHashTable;
+
+typedef struct CompletedRequestNode {
+    Request request;
+    struct CompletedRequestNode* next;
+} CompletedRequestNode;
+
+typedef struct {
+    CompletedRequestNode* head;
+    CompletedRequestNode* tail;
+} CompletedRequestList;
+
+void clearInputBuffer(void);
+
+void initRequestHashTable(RequestHashTable* table) {
+    for (int i = 0; i < HASH_TABLE_SIZE; i++) table->buckets[i] = NULL;
+}
+
+RequestHashNode* findRequest(RequestHashTable* table, int requestId) {
+    int bucket = requestId % HASH_TABLE_SIZE;
+    RequestHashNode* node = table->buckets[bucket];
+    while (node != NULL) {
+        if (node->request.requestId == requestId) return node;
+        node = node->next;
+    }
+    return NULL;
+}
+
+bool insertRequest(RequestHashTable* table, Request request, RequestStatus status) {
+    int bucket = request.requestId % HASH_TABLE_SIZE;
+    RequestHashNode* node = malloc(sizeof(*node));
+    if (node == NULL) return false;
+    node->request = request;
+    node->status = status;
+    node->next = table->buckets[bucket];
+    table->buckets[bucket] = node;
+    return true;
+}
+
+bool appendCompletedRequest(CompletedRequestList* list, Request request) {
+    CompletedRequestNode* node = malloc(sizeof(*node));
+    if (node == NULL) return false;
+    node->request = request;
+    node->next = NULL;
+    if (list->tail == NULL) {
+        list->head = node;
+    } else {
+        list->tail->next = node;
+    }
+    list->tail = node;
+    return true;
+}
+
+const char* requestStatusName(RequestStatus status) {
+    switch (status) {
+        case REQUEST_QUEUED: return "Queued";
+        case REQUEST_COMPLETED: return "Completed";
+        case REQUEST_UNSERVED: return "Could not be served";
+        case REQUEST_REJECTED: return "Rejected (queue full)";
+        case REQUEST_PROCESSING: return "Processing";
+    }
+    return "Unknown";
+}
+
+void freeRequestData(RequestHashTable* table, CompletedRequestList* list) {
+    for (int i = 0; i < HASH_TABLE_SIZE; i++) {
+        RequestHashNode* node = table->buckets[i];
+        while (node != NULL) {
+            RequestHashNode* next = node->next;
+            free(node);
+            node = next;
+        }
+    }
+    CompletedRequestNode* node = list->head;
+    while (node != NULL) {
+        CompletedRequestNode* next = node->next;
+        free(node);
+        node = next;
+    }
+}
+
 void initQueue(Queue* q) {
     q->front = 0;
     q->rear = -1;
@@ -52,14 +150,15 @@ bool isQueueFull(Queue* q) {
     return (q->count == MAX_QUEUE);
 }
 
-void enqueueNormal(Queue* q, Request req) {
+bool enqueueNormal(Queue* q, Request req) {
     if (isQueueFull(q)) {
         printf("[NOTICE] Normal request queue is full. Please try again later.\n");
-        return;
+        return false;
     }
     q->rear = (q->rear + 1) % MAX_QUEUE;
     q->items[q->rear] = req;
     q->count++;
+    return true;
 }
 
 bool dequeueNormal(Queue* q, Request* outReq) {
@@ -78,13 +177,14 @@ bool isPriorityQueueEmpty(PriorityQueue* pq) {
     return (pq->size == 0);
 }
 
-void insertEmergency(PriorityQueue* pq, Request req) {
+bool insertEmergency(PriorityQueue* pq, Request req) {
     if (pq->size >= MAX_QUEUE) {
         printf("[NOTICE] Emergency queue is full.\n");
-        return;
+        return false;
     }
     pq->items[pq->size] = req;
     pq->size++;
+    return true;
 }
 
 bool extractEmergency(PriorityQueue* pq, Request* outReq) {
@@ -269,6 +369,58 @@ bool serveRequest(Elevator elevators[], Request req) {
     return true;
 }
 
+void dispatchAndRecord(Elevator elevators[], Request request,
+                       RequestHashTable* requestTable, CompletedRequestList* completedRequests) {
+    RequestHashNode* record = findRequest(requestTable, request.requestId);
+    if (record != NULL) record->status = REQUEST_PROCESSING;
+
+    bool completed = serveRequest(elevators, request);
+    if (record != NULL) {
+        record->status = completed ? REQUEST_COMPLETED : REQUEST_UNSERVED;
+    }
+    if (completed && !appendCompletedRequest(completedRequests, request)) {
+        printf("[NOTICE] Trip completed, but it could not be added to history (out of memory).\n");
+    }
+}
+
+void displayCompletedRequests(const CompletedRequestList* list) {
+    const CompletedRequestNode* node = list->head;
+    if (node == NULL) {
+        printf("\n[INFO] No completed trips in history.\n");
+        return;
+    }
+
+    printf("\nCOMPLETED REQUEST HISTORY\n");
+    while (node != NULL) {
+        printf("Request #%d: Floor %d -> Floor %d (%s)\n",
+               node->request.requestId, node->request.pickupFloor,
+               node->request.destFloor,
+               node->request.priority == 1 ? "Emergency" : "Normal");
+        node = node->next;
+    }
+}
+
+void lookupRequest(RequestHashTable* requestTable) {
+    int requestId;
+    printf("Enter request ID: ");
+    if (scanf("%d", &requestId) != 1 || requestId < 1) {
+        printf("[ERROR] Enter a valid positive request ID.\n");
+        clearInputBuffer();
+        return;
+    }
+
+    RequestHashNode* record = findRequest(requestTable, requestId);
+    if (record == NULL) {
+        printf("[INFO] Request #%d was not found.\n", requestId);
+        return;
+    }
+    printf("Request #%d: Floor %d -> Floor %d | %s | %s\n",
+           record->request.requestId, record->request.pickupFloor,
+           record->request.destFloor,
+           record->request.priority == 1 ? "Emergency" : "Normal",
+           requestStatusName(record->status));
+}
+
 void clearInputBuffer(void) {
     int c;
     while ((c = getchar()) != '\n' && c != EOF);
@@ -311,9 +463,12 @@ int main(void) {
 
     Queue normalQueue;
     PriorityQueue emergencyQueue;
+    RequestHashTable requestTable;
+    CompletedRequestList completedRequests = {NULL, NULL};
 
     initQueue(&normalQueue);
     initPriorityQueue(&emergencyQueue);
+    initRequestHashTable(&requestTable);
     initBuildingGraph();
 
     int requestCounter = 1;
@@ -326,13 +481,15 @@ int main(void) {
         printf("3. Process Next Queued Request\n");
         printf("4. Display Elevator Fleet Status\n");
         printf("5. View Building & Route Guide\n");
-        printf("6. Exit\n");
+        printf("6. Look Up Request by ID\n");
+        printf("7. Display Completed Trip History\n");
+        printf("8. Exit\n");
 
     while (1) {
-        printf("\nEnter your choice (1-6): ");
+        printf("\nEnter your choice (1-8): ");
 
         if (scanf("%d", &choice) != 1) {
-            printf("\n[ERROR] Invalid input! Please enter a number between 1 and 6.\n");
+            printf("\n[ERROR] Invalid input! Please enter a number between 1 and 8.\n");
             clearInputBuffer();
             continue;
         }
@@ -367,8 +524,13 @@ int main(void) {
                     break;
                 }
 
-                Request req = {requestCounter++, pickup, dest, priority};
-                serveRequest(elevators, req);
+                Request req = {requestCounter, pickup, dest, priority};
+                if (!insertRequest(&requestTable, req, REQUEST_PROCESSING)) {
+                    printf("[ERROR] Request could not be tracked (out of memory).\n");
+                    break;
+                }
+                requestCounter++;
+                dispatchAndRecord(elevators, req, &requestTable, &completedRequests);
                 break;
             }
 
@@ -401,13 +563,29 @@ int main(void) {
                     break;
                 }
 
-                Request req = {requestCounter++, pickup, dest, priority};
+                Request req = {requestCounter, pickup, dest, priority};
+                if (!insertRequest(&requestTable, req, REQUEST_QUEUED)) {
+                    printf("[ERROR] Request could not be tracked (out of memory).\n");
+                    break;
+                }
+                requestCounter++;
+
+                bool queued;
                 if (priority == 1) {
-                    insertEmergency(&emergencyQueue, req);
+                    queued = insertEmergency(&emergencyQueue, req);
+                } else {
+                    queued = enqueueNormal(&normalQueue, req);
+                }
+                if (!queued) {
+                    RequestHashNode* record = findRequest(&requestTable, req.requestId);
+                    if (record != NULL) record->status = REQUEST_REJECTED;
+                    break;
+                }
+
+                if (priority == 1) {
                     printf("\n[SUCCESS] EMERGENCY Request #%d (Floor %d -> %d) added to Priority Queue!\n",
                            req.requestId, req.pickupFloor, req.destFloor);
                 } else {
-                    enqueueNormal(&normalQueue, req);
                     printf("\n[SUCCESS] Normal Request #%d (Floor %d -> %d) added to Standard FIFO Queue.\n",
                            req.requestId, req.pickupFloor, req.destFloor);
                 }
@@ -426,11 +604,11 @@ int main(void) {
                 if (extractEmergency(&emergencyQueue, &activeReq)) {
                     printf("\n[PRIORITY QUEUE] Processing HIGH-PRIORITY Emergency Request #%d ahead of normal queue!\n",
                            activeReq.requestId);
-                    serveRequest(elevators, activeReq);
+                    dispatchAndRecord(elevators, activeReq, &requestTable, &completedRequests);
                 } else if (dequeueNormal(&normalQueue, &activeReq)) {
                     printf("\n[NORMAL QUEUE] Processing Standard Request #%d in FIFO order...\n",
                            activeReq.requestId);
-                    serveRequest(elevators, activeReq);
+                    dispatchAndRecord(elevators, activeReq, &requestTable, &completedRequests);
                 }
                 break;
             }
@@ -447,13 +625,24 @@ int main(void) {
                 break;
             }
 
-            case 6: { // Exit
+            case 6: {
+                lookupRequest(&requestTable);
+                break;
+            }
+
+            case 7: {
+                displayCompletedRequests(&completedRequests);
+                break;
+            }
+
+            case 8: { // Exit
                 printf("\nThank you for using the Smart Elevator Dispatch System!\n");
+                freeRequestData(&requestTable, &completedRequests);
                 return 0;
             }
 
             default: {
-                printf("\n[ERROR] Choice out of range! Enter a number between 1 and 6.\n");
+                printf("\n[ERROR] Choice out of range! Enter a number between 1 and 8.\n");
                 break;
             }
         }
